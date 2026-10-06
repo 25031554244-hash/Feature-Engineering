@@ -1,0 +1,432 @@
+# ============================================================
+# 1. INSTALL LIBRARY YANG DIBUTUHKAN
+# ============================================================
+!pip install -q gensim umap-learn beautifulsoup4 requests pandas matplotlib openpyxl
+
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import re
+from gensim.models import Word2Vec
+import umap.umap_ as umap
+import os
+
+# ============================================================
+# 2. FOLDER HASIL
+# ============================================================
+output_folder = "Hasil_Feature_Engineering"
+os.makedirs(output_folder, exist_ok=True)
+
+print("=" * 60)
+print("SCRAPING DATA PROVINSI INDONESIA")
+print("=" * 60)
+
+# ============================================================
+# 3. LOAD DATA DARI WIKIPEDIA
+# ============================================================
+url = "https://en.wikipedia.org/wiki/Provinces_of_Indonesia"
+
+headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+}
+
+response = requests.get(url, headers=headers)
+
+print("Status website:", response.status_code)
+
+if response.status_code != 200:
+    raise Exception("Website gagal diakses.")
+
+soup = BeautifulSoup(response.content, 'html.parser')
+
+tables = soup.find_all('table', class_='wikitable')
+
+print("Jumlah tabel:", len(tables))
+
+target_table = None
+
+for table in tables:
+    if "Banda Aceh" in table.text or "Aceh" in table.text:
+        target_table = table
+        break
+
+if target_table is None:
+    raise Exception("Tabel provinsi tidak ditemukan.")
+
+print("Tabel provinsi berhasil ditemukan.")
+
+# ============================================================
+# 4. SCRAPING DATA PROVINSI
+# ============================================================
+data = []
+rows = target_table.find_all('tr')
+
+for row in rows:
+    cols = row.find_all('td')
+
+    if not cols:
+        continue
+
+    row_text = [
+        re.sub(r'[\*\[\]]', '', c.get_text(" ", strip=True))
+        for c in cols
+    ]
+
+    if len(row_text) >= 7 and row_text[0].isdigit():
+
+        iso_code = row_text[0]
+        abbr = row_text[1]
+
+        # ----------------------------------------------------
+        # Mengambil URL Wikipedia setiap provinsi
+        # ----------------------------------------------------
+        wiki_url = ""
+
+        for cell in cols:
+            link = cell.find('a', href=True)
+
+            if link:
+                href = link['href']
+
+                if (
+                    href.startswith('/wiki/')
+                    and not href.startswith('/wiki/ISO')
+                    and not href.startswith('/wiki/File:')
+                ):
+                    wiki_url = "https://en.wikipedia.org" + href
+                    break
+
+        # ----------------------------------------------------
+        # Mengambil informasi provinsi
+        # ----------------------------------------------------
+        text_parts = [
+            t for t in row_text
+            if not re.match(r'^\d[\d,\s.]*$', t)
+        ]
+
+        province_eng = text_parts[1] if len(text_parts) > 1 else ""
+        province_ind = text_parts[2] if len(text_parts) > 2 else ""
+        capital = text_parts[3] if len(text_parts) > 3 else ""
+
+        data.append([
+            iso_code,
+            abbr,
+            province_eng,
+            province_ind,
+            capital,
+            wiki_url
+        ])
+
+# ============================================================
+# 5. MEMBUAT DATAFRAME
+# ============================================================
+df = pd.DataFrame(
+    data,
+    columns=[
+        'Code',
+        'Abbreviation',
+        'Province',
+        'Indonesian_Name',
+        'Capital',
+        'Wikipedia_URL'
+    ]
+)
+
+df.insert(0, 'No', range(1, len(df) + 1))
+
+print("\nJumlah data provinsi:", len(df))
+
+print("\n--- DATA HASIL SCRAPING ---")
+display(df.head(10))
+
+# ============================================================
+# 6. FEATURE ENGINEERING
+# ============================================================
+print("\n" + "=" * 60)
+print("MENJALANKAN FEATURE ENGINEERING")
+print("=" * 60)
+
+# ------------------------------------------------------------
+# Menggabungkan teks
+# ------------------------------------------------------------
+df['text_combined'] = (
+    df['Province'].fillna('') + ' ' +
+    df['Indonesian_Name'].fillna('') + ' ' +
+    df['Capital'].fillna('')
+).str.strip()
+
+# Tokenisasi sederhana
+sentences = [
+    doc.split()
+    for doc in df['text_combined']
+    if len(doc.split()) > 0
+]
+
+# ============================================================
+# 7. TRAINING WORD2VEC
+# ============================================================
+w2v_model = Word2Vec(
+    sentences=sentences,
+    vector_size=100,
+    window=5,
+    min_count=1,
+    workers=4,
+    sg=1,
+    seed=42
+)
+
+print("Word2Vec berhasil dibuat.")
+print("Jumlah vocabulary:", len(w2v_model.wv))
+
+# ============================================================
+# 8. DOCUMENT VECTOR DENGAN MEAN POOLING
+# ============================================================
+def get_document_vector(tokens, model):
+
+    valid_vectors = [
+        model.wv[word]
+        for word in tokens
+        if word in model.wv
+    ]
+
+    if not valid_vectors:
+        return np.zeros(model.vector_size)
+
+    return np.mean(valid_vectors, axis=0)
+
+
+X_features = np.array([
+    get_document_vector(
+        doc.split(),
+        w2v_model
+    )
+    for doc in df['text_combined']
+])
+
+# ============================================================
+# 9. MEMBUAT TABEL FEATURE
+# ============================================================
+feature_columns = [
+    f'Feature_{i+1}'
+    for i in range(X_features.shape[1])
+]
+
+df_features = pd.DataFrame(
+    X_features,
+    columns=feature_columns
+)
+
+# Tambahkan informasi identitas
+df_features.insert(0, 'Wikipedia_URL', df['Wikipedia_URL'])
+df_features.insert(0, 'Capital', df['Capital'])
+df_features.insert(0, 'Indonesian_Name', df['Indonesian_Name'])
+df_features.insert(0, 'Province', df['Province'])
+df_features.insert(0, 'No', df['No'])
+
+print("\n--- HASIL FEATURE ENGINEERING ---")
+display(df_features.head(10))
+
+# ============================================================
+# 10. REDUKSI DIMENSI DENGAN UMAP
+# ============================================================
+print("\n" + "=" * 60)
+print("MENJALANKAN UMAP")
+print("=" * 60)
+
+words = list(w2v_model.wv.index_to_key)
+
+word_vectors = np.array([
+    w2v_model.wv[word]
+    for word in words
+])
+
+reducer = umap.UMAP(
+    n_neighbors=5,
+    min_dist=0.1,
+    random_state=42
+)
+
+embedding_2d = reducer.fit_transform(word_vectors)
+
+df_umap = pd.DataFrame({
+    'umap1': embedding_2d[:, 0],
+    'umap2': embedding_2d[:, 1],
+    'word': words
+})
+
+# ============================================================
+# 11. GRAFIK UMAP
+# ============================================================
+plt.figure(figsize=(14, 9))
+
+plt.scatter(
+    df_umap['umap1'],
+    df_umap['umap2'],
+    alpha=0.7
+)
+
+for i, word in enumerate(words):
+
+    plt.annotate(
+        word,
+        (
+            df_umap['umap1'].iloc[i],
+            df_umap['umap2'].iloc[i]
+        ),
+        fontsize=8
+    )
+
+plt.title(
+    'UMAP Feature Visualization (Word Embedding)',
+    fontsize=14
+)
+
+plt.xlabel('UMAP Dimension 1')
+plt.ylabel('UMAP Dimension 2')
+
+plt.grid(
+    True,
+    linestyle='--',
+    alpha=0.5
+)
+
+plt.tight_layout()
+
+# Simpan grafik
+umap_file = os.path.join(
+    output_folder,
+    "UMAP_Feature_Visualization.png"
+)
+
+plt.savefig(
+    umap_file,
+    dpi=300,
+    bbox_inches='tight'
+)
+
+plt.show()
+
+print("\nGrafik berhasil disimpan:")
+print(umap_file)
+
+# ============================================================
+# 12. GRAFIK JUMLAH PROVINSI
+# ============================================================
+plt.figure(figsize=(12, 6))
+
+plt.bar(
+    df['Province'],
+    range(1, len(df) + 1)
+)
+
+plt.title(
+    'Data Provinsi Indonesia',
+    fontsize=14
+)
+
+plt.xlabel('Provinsi')
+plt.ylabel('Nomor Data')
+
+plt.xticks(
+    rotation=90,
+    fontsize=7
+)
+
+plt.tight_layout()
+
+province_graph = os.path.join(
+    output_folder,
+    "Grafik_Data_Provinsi.png"
+)
+
+plt.savefig(
+    province_graph,
+    dpi=300,
+    bbox_inches='tight'
+)
+
+plt.show()
+
+print("Grafik provinsi berhasil disimpan:")
+print(province_graph)
+
+# ============================================================
+# 13. EXPORT CSV
+# ============================================================
+csv_file = os.path.join(
+    output_folder,
+    "Data_Provinsi_Features.csv"
+)
+
+df_features.to_csv(
+    csv_file,
+    index=False
+)
+
+# ============================================================
+# 14. EXPORT EXCEL
+# ============================================================
+excel_file = os.path.join(
+    output_folder,
+    "Data_Provinsi_Features.xlsx"
+)
+
+with pd.ExcelWriter(
+    excel_file,
+    engine='openpyxl'
+) as writer:
+
+    # Sheet 1: Data hasil scraping
+    df.to_excel(
+        writer,
+        sheet_name='Data_Provinsi',
+        index=False
+    )
+
+    # Sheet 2: Feature Engineering
+    df_features.to_excel(
+        writer,
+        sheet_name='Features',
+        index=False
+    )
+
+    # Sheet 3: Data UMAP
+    df_umap.to_excel(
+        writer,
+        sheet_name='UMAP',
+        index=False
+    )
+
+print("\n" + "=" * 60)
+print("PROSES SELESAI")
+print("=" * 60)
+
+print("\nFile yang dihasilkan:")
+
+print("1. Excel:")
+print(excel_file)
+
+print("\n2. CSV:")
+print(csv_file)
+
+print("\n3. Grafik UMAP:")
+print(umap_file)
+
+print("\n4. Grafik Data Provinsi:")
+print(province_graph)
+
+print("\nFolder hasil:")
+print(output_folder)
+
+# ============================================================
+# 15. TAMPILKAN RINGKASAN HASIL
+# ============================================================
+print("\n--- RINGKASAN ---")
+print("Jumlah provinsi :", len(df))
+print("Jumlah fitur    :", X_features.shape[1])
+print("Jumlah vocabulary:", len(words))
+
+print("\nSemua hasil sudah tersimpan di folder:")
+print(f"📁 {output_folder}")
